@@ -47,7 +47,6 @@ coverage/
 *~
 
 # IDE / editor
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -162,3 +161,7 @@ coverage/
 
 # Cargo lock (keep for binaries, optional for libs — keeping for reproducibility)
 # Cargo.lock  # intentionally tracked
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
