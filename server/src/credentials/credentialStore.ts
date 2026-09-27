@@ -28,19 +28,7 @@ export interface VerificationRecord {
   nextVerificationRequired: number; // timestamp when re-verification is required
 }
 
-/** Issue #1743: emitted whenever a credential's status (or verification status) changes. */
-export interface CredentialStatusChange {
-  credentialId: string;
-  holderId: string;
-  status: Credential["status"];
-  verificationStatus?: VerificationRecord["verificationStatus"];
-  previousStatus?: Credential["status"];
-  changedAt: number;
-}
-
-export type CredentialStatusListener = (change: CredentialStatusChange) => void;
-
-class CredentialStore {
+export class CredentialStore {
   private credentials = new Map<string, Credential>();
   /** Issue #1742: issuer -> credential ids, so pattern search runs the regex once
    * per distinct issuer instead of once per credential. */
@@ -97,6 +85,10 @@ class CredentialStore {
     return Array.from(this.credentials.values()).filter(
       (c) => c.holderId === holderId
     );
+  }
+
+  getAllCredentials(): Credential[] {
+    return Array.from(this.credentials.values());
   }
 
   /**
