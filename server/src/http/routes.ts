@@ -15,26 +15,13 @@ import { notificationStore } from "../notifications/notificationStore.js";
 import type { NotificationDelivery } from "../notifications/notificationDelivery.js";
 import { exportStore } from "../exports/exportStore.js";
 import { ComplexityScorer } from "../verification/complexityScorer.js";
-// Issue #1590/#1591: the credential HTTP surface below was written against these
-// singletons but the imports were never added, so every `/credentials/*` route
-// threw at runtime. Restored here.
 import { credentialStore } from "../credentials/credentialStore.js";
+import type { EventStore } from "../bridge/eventStore.js";
+import type { ApiRateLimiter } from "../auth/apiRateLimiter.js";
 import {
-  generateProof,
-  exportProofJson,
-  importProofJson,
-} from "../credentials/proofGenerator.js";
-import { identityVerificationService } from "../credentials/identityVerificationService.js";
-import { analyticsService } from "../credentials/analyticsService.js";
-// Issue #1766: credential relationship graph.
-import { credentialLinkingService } from "../credentials/credentialLinkingService.js";
-import type { LinkRejectionCode } from "../credentials/credentialLinkingService.js";
-import type { CostAllocator } from "../costs/costAllocator.js";
-import type { PartitionGuard } from "../resilience/partitionGuard.js";
-import { tokenExpirationMonitor } from "../auth/tokenExpirationMonitor.js";
-import { handleSearchRequest } from "./searchRoutes.js";
-import { handleWebhookRequest, type WebhookRoutesContext } from "./webhookRoutes.js";
-import type { FacetedSearchService } from "../search/facetedSearch.js";
+  handleApiV1Request,
+  handleTierLimitedGraphqlRequest,
+} from "./apiV1Routes.js";
 
 export interface RouteContext {
   authSecret: string;
@@ -62,8 +49,10 @@ export interface RouteContext {
   notificationDelivery?: NotificationDelivery;
   /** Issue #1585 — Credential verification complexity scoring and analysis. */
   complexityScorer?: ComplexityScorer;
-  /** Issue #1588 — faceted search service; wired by `index.ts`. */
-  searchService?: FacetedSearchService;
+  /** Issue #1747 — indexed event source for GraphQL queries. */
+  eventStore?: EventStore;
+  /** Issue #1748 — shared/local user-tier API request limiter. */
+  apiRateLimiter?: ApiRateLimiter;
 }
 
 /**
@@ -147,6 +136,43 @@ export function handleHttpRequest(
 ): void {
   const url = new URL(req.url ?? "", "http://internal");
 
+  // Issue #1745: deprecation headers + usage tracking for deprecated endpoints.
+  applyDeprecationHeaders(req, res);
+
+  // Issue #1745: deprecated endpoint registry and usage report
+  if (req.method === "GET" && url.pathname === "/api/v1/deprecations") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ deprecations: deprecationRegistry.report() }));
+    return;
+  }
+
+  // Issue #1742: GET /api/v1/credentials/search?issuer_pattern=<regex>
+  if (req.method === "GET" && url.pathname === "/api/v1/credentials/search") {
+    const pattern = url.searchParams.get("issuer_pattern");
+    if (!pattern) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "issuer_pattern query parameter is required" }));
+      return;
+    }
+    const limit = url.searchParams.get("limit");
+    const offset = url.searchParams.get("offset");
+    const result = searchCredentialsByIssuerPattern(pattern, {
+      caseSensitive: url.searchParams.get("case_sensitive") === "true",
+      status: (url.searchParams.get("status") ?? undefined) as Credential["status"] | undefined,
+      type: (url.searchParams.get("type") ?? undefined) as Credential["type"] | undefined,
+      limit: limit ? Number.parseInt(limit, 10) || undefined : undefined,
+      offset: offset ? Number.parseInt(offset, 10) || undefined : undefined,
+    });
+    if ("error" in result) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: result.error }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
   // Health check
   if (req.method === "GET" && url.pathname === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
@@ -158,6 +184,34 @@ export function handleHttpRequest(
   if (req.method === "GET" && url.pathname === "/metrics") {
     res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
     res.end(metrics.toPrometheusText());
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/v1/")) {
+    handleApiV1Request(req, res, url, {
+      authSecret: ctx.authSecret,
+      revocationStore: ctx.revocationStore,
+      apiRateLimiter: ctx.apiRateLimiter,
+    });
+    return;
+  }
+
+  if (url.pathname === "/graphql") {
+    if (!ctx.eventStore) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ errors: [{ message: "GraphQL data sources are unavailable" }] }));
+      return;
+    }
+    handleTierLimitedGraphqlRequest(
+      req,
+      res,
+      {
+        authSecret: ctx.authSecret,
+        revocationStore: ctx.revocationStore,
+        apiRateLimiter: ctx.apiRateLimiter,
+      },
+      { credentials: credentialStore, events: ctx.eventStore }
+    );
     return;
   }
 
@@ -758,7 +812,13 @@ export function handleHttpRequest(
         return;
       }
 
-      const issued = issueToken(ctx.authSecret, body.apiKey, ctx.tokenTtlSeconds, body.borrower);
+      const issued = issueToken(
+        ctx.authSecret,
+        body.apiKey,
+        ctx.tokenTtlSeconds,
+        body.borrower,
+        keyStore.getTier(body.apiKey)
+      );
 
       // Issue #1593: Register token with expiration monitor
       const now = Math.floor(Date.now() / 1000);

@@ -71,6 +71,40 @@ hard expiry (30s default warning window) so clients can refresh in-band —
 dropping the connection. If a client never refreshes, the server sends `auth_expired`
 and disconnects.
 
+## API extensions
+
+The service adds a bearer-token-authenticated GraphQL endpoint and versioned API
+alongside the existing routes:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /graphql` | Queries credentials, verifications, verification statistics, and indexed events. Query complexity is capped at 100; list arguments are bounded to 100. |
+| `GET /api/v1/limits` | Current bearer-token tier, usage, limit, and reset time. |
+| `GET /api/v1/retry-stats` | Per-operation retry attempts, retries, outcomes, and accumulated delay. |
+| `POST /api/v1/credentials/import/batch` | Import up to 500 credentials as a JSON array or CSV (`holderId,type,issuer,expiresAt,metadata`). Returns `202` with an import ID and row-level results. |
+| `GET /api/v1/credentials/import/{importId}` | Poll batch progress and row-level validation/import results; only the submitting API identity can read it. |
+
+JSON rows use `holderId`, `type` (`identity`, `education`, `professional`, or
+`financial`), `issuer`, `expiresAt` (future Unix timestamp in seconds), and
+optional object-valued `metadata`. Both formats are limited to 2 MiB. Import
+tracking and the existing credential store are in memory: records do not survive
+restart or replicate between instances; durable credential storage is outside the
+service's current storage design.
+
+Provisioned API keys default to the `free` tier. `API_KEY_TIERS` accepts a JSON
+object mapping each provisioned key's SHA-256 hash to `free`, `pro`, or
+`enterprise`. `/api/v1/*` bearer tokens carry that tier and return `X-RateLimit-*`
+headers. Defaults are 100, 1,000, and 10,000 requests per minute respectively;
+`API_RATE_LIMIT_FREE`, `API_RATE_LIMIT_PRO`, `API_RATE_LIMIT_ENTERPRISE`, and
+`API_RATE_LIMIT_WINDOW_MS` override the quotas. `REDIS_URL` enables atomic shared
+limits across replicas; without it, limits are per process. Retry statistics are
+also process-local.
+
+Retries use `RetryExecutor` (`src/resilience/retry.ts`) with per-operation
+policies and full jitter over capped exponential delays. Webhook delivery retains
+its five retries, 500 ms base, and 8 s cap; other operations can configure
+policies with `setPolicy`.
+
 **Resume cursor**: every broadcast event carries the underlying indexer row's `id`
 (monotonic). Loan-stream clients pass `since` on `subscribe({borrower, since})` to
 replay everything they missed before going live. Metrics is a cumulative gauge, not a
@@ -114,3 +148,22 @@ npm run loadtest -- --connections 200   # smoke-scale; see scripts/loadtest.ts f
 This service only *reads* the indexer's SQLite file (`better-sqlite3`, `readonly:
 true`) — it never writes to it, so there's no contention with the indexer process.
 Run them side by side, pointed at the same `--db-path`/`INDEXER_DB_PATH`.
+
+## Credential search, status stream, idempotency and deprecation (#1742–#1745)
+
+- **Issuer pattern search (#1742)** — `GET /api/v1/credentials/search?issuer_pattern=<regex>`
+  (optional `case_sensitive`, `status`, `type`, `limit`, `offset`). Patterns are validated
+  (max 256 chars, no nested quantifiers or backreferences), compiled regexes are LRU-cached,
+  and matching runs once per distinct issuer via an issuer index.
+- **Credential status WebSocket (#1743)** — `/ws/credentials/status?token=<jwt>`. Send
+  `{"type":"subscribe","credentialIds":[...]}` or `{"type":"subscribe","holderId":"..."}`;
+  the server replies with a `snapshot` per credential, then `delta` frames containing only
+  the changed fields. Connections are admitted through a pool with global and per-client caps.
+- **Idempotency keys (#1744)** — send `Idempotency-Key` on POST/PUT/PATCH/DELETE. Retries
+  replay the stored response (`Idempotent-Replayed: true`); in-flight duplicates get 409, and
+  reusing a key with a different payload gets 422. Records expire after 24h and are swept
+  every 10 minutes.
+- **Deprecation headers (#1745)** — deprecated endpoints return `Deprecation`, `Sunset`,
+  `Link` and `Warning: 299` headers. Usage is counted per endpoint/client
+  (`qc_deprecated_endpoint_requests_total`), alerts are raised (throttled, escalating near
+  sunset), and `GET /api/v1/deprecations` reports registered endpoints and usage.

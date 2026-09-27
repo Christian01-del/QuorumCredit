@@ -279,6 +279,7 @@ https://ndifreke000.github.io/QuorumCredit/
 - [Loan Cart Guide](docs/loan-cart-guide.md) — batch loan staging, volume discounts, abandonment analytics
 - [Loan Priority & Waterfall](docs/loan-priority-waterfall.md) — senior/mezzanine/junior tranching and default-proceeds routing
 - [Loan Attribution Model](docs/loan-attribution-model.md) — heuristic performance attribution (40%/35%/15%/10%) and known limitations
+- [Credential Flow](docs/credential-flow.md) — sequence, swimlane and API-call diagrams for issuance, identity/document/challenge verification and proof export
 
 ### Deploy to Testnet
 
@@ -1037,3 +1038,4 @@ MIT
 
 <!-- handsoff-issue-1564 -->
 - #1564: Add API Request Fingerprinting for Fraud Detection
+
